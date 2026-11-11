@@ -1,5 +1,6 @@
 import os
 import glob
+import asyncio
 import telebot
 from telebot import types
 import yt_dlp
@@ -13,7 +14,8 @@ WELCOME = """سلام! به ReelTune خوش اومدی 🎵
 آهنگی که شنیدی، همین‌جا بگیر
 
 اسم آهنگ، بخشی از متنش، یا لینک ریلز اینستاگرام رو بفرست.
-اگه چند نسخه بود (اصلی، ریمیکس، لایو...)، لیستش رو نشون می‌دم و خودت انتخاب می‌کنی."""
+اگه چند نسخه بود (اصلی، ریمیکس، لایو...)، لیستش رو نشون می‌دم و خودت انتخاب می‌کنی.
+برای ریلز، آهنگ کاملش رو پیدا می‌کنم و می‌فرستم."""
 
 PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
@@ -26,7 +28,6 @@ def normalize(text):
 
 
 def search_source(query, limit=5):
-    """Search one yt-dlp source, return [{title, url, source}] or []."""
     opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
@@ -59,7 +60,6 @@ def search_source(query, limit=5):
 
 
 def search_all(text):
-    """Search like Google: name or a piece of lyrics, across sources."""
     base = normalize(text)
     results = []
     seen = set()
@@ -72,15 +72,22 @@ def search_all(text):
             seen.add(key)
             results.append(item)
 
-    # Main search: YouTube finds songs by name and by lyrics snippets,
-    # because titles and descriptions often contain the lyrics.
     add(search_source('ytsearch5:' + base, limit=5))
-    # If the text looks like lyrics (a longer phrase), try it with "lyrics" too.
     if len(base.split()) >= 3:
         add(search_source('ytsearch5:' + base + ' lyrics', limit=3))
-    # SoundCloud often has remixes and versions YouTube does not.
     add(search_source('scsearch3:' + base, limit=3))
     return results[:8]
+
+
+def show_results(chat_id, results, header):
+    RESULTS[chat_id] = results
+    lines = [header, ""]
+    markup = types.InlineKeyboardMarkup()
+    for i, item in enumerate(results):
+        lines.append(f"{i + 1}. {item['title']} ({item['source']})")
+        label = item['title'][:30]
+        markup.add(types.InlineKeyboardButton(f"{i + 1}. {label}", callback_data=f"dl:{i}"))
+    bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
 
 
 def download_audio(query):
@@ -127,6 +134,87 @@ def send_song(chat_id, filename, title):
         bot.send_document(chat_id, f, caption="🎵 " + title)
 
 
+def reel_song_name(url):
+    """Try Instagram's own music credit for a reel. Returns 'Artist - Track' or None."""
+    opts = {'quiet': True, 'no_warnings': True, 'skip_download': True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        print('ReelTune reel info failed:', repr(e), flush=True)
+        return None
+    track = info.get('track')
+    artist = info.get('artist')
+    if track:
+        return f"{artist} - {track}" if artist else str(track)
+    return None
+
+
+def recognize_song(filename):
+    """Listen to an audio file with Shazam and return 'Artist - Title' or None."""
+    try:
+        from shazamio import Shazam
+    except Exception as e:
+        print('ReelTune shazam import failed:', repr(e), flush=True)
+        return None
+
+    async def _run():
+        shazam = Shazam()
+        return await shazam.recognize(filename)
+
+    try:
+        out = asyncio.run(_run())
+    except Exception as e:
+        print('ReelTune shazam failed:', repr(e), flush=True)
+        return None
+    track = (out or {}).get('track') or {}
+    title = track.get('title')
+    artist = track.get('subtitle')
+    if not title:
+        return None
+    return f"{artist} - {title}" if artist else str(title)
+
+
+def handle_reel(chat_id, url):
+    bot.send_message(chat_id, "دارم آهنگ ریلز رو پیدا می‌کنم... 🎧")
+    # 1) Instagram's own music credit, when the reel has one.
+    song = reel_song_name(url)
+    if song:
+        bot.send_message(chat_id, f"آهنگ ریلز: {song}\nحالا کاملش رو پیدا می‌کنم... 🔍")
+        results = search_all(song)
+        if results:
+            show_results(chat_id, results, f"🎵 کامل «{song}» رو پیدا کردم، یکی رو انتخاب کن:")
+            return
+    # 2) Listen to the reel audio and recognise it (Shazam).
+    try:
+        filename, _title = download_audio(url)
+    except Exception as e:
+        print('ReelTune reel download failed:', repr(e), flush=True)
+        bot.send_message(chat_id, "نتونستم ریلز رو دانلود کنم. لینک درست رو دوباره بفرست.")
+        return
+    song = recognize_song(filename)
+    if song:
+        try:
+            os.remove(filename)
+        except OSError:
+            pass
+        bot.send_message(chat_id, f"آهنگ ریلز: {song}\nحالا کاملش رو پیدا می‌کنم... 🔍")
+        results = search_all(song)
+        if results:
+            show_results(chat_id, results, f"🎵 کامل «{song}» رو پیدا کردم، یکی رو انتخاب کن:")
+            return
+        bot.send_message(chat_id, "اسم آهنگ رو پیدا کردم ولی کاملش رو نتونستم دانلود کنم. دوباره امتحان کن.")
+        return
+    # 3) Fallback: we could not name the song, send the reel audio itself.
+    bot.send_message(chat_id, "اسم آهنگ رو پیدا نکردم، صداش رو از خود ریلز می‌فرستم. اگه اسمش رو بفرستی، کاملش رو پیدا می‌کنم.")
+    try:
+        send_song(chat_id, filename, "ReelTune")
+        os.remove(filename)
+    except Exception as e:
+        print('ReelTune reel fallback send failed:', repr(e), flush=True)
+        bot.send_message(chat_id, "نتونستم ریلز رو بفرستم. لینک درست رو دوباره بفرست.")
+
+
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.reply_to(message, WELCOME)
@@ -138,14 +226,7 @@ def handle(message):
     if not text:
         return
     if "instagram.com" in text or "instagr.am" in text:
-        bot.reply_to(message, "دارم پیداش می‌کنم... 🎧")
-        try:
-            filename, title = download_audio(text)
-            send_song(message.chat.id, filename, title)
-            os.remove(filename)
-        except Exception as e:
-            print('ReelTune handle failed for', repr(text), ':', repr(e), flush=True)
-            bot.reply_to(message, "نتونستم پیداش کنم. لینک درست رو دوباره بفرست.")
+        handle_reel(message.chat.id, text)
         return
 
     bot.reply_to(message, "دارم می‌گردم... 🔍")
@@ -157,15 +238,7 @@ def handle(message):
     if not results:
         bot.reply_to(message, "نتونستم پیداش کنم. اسم دقیق‌تر، بخشی از متن آهنگ، یا لینک درست رو دوباره بفرست.")
         return
-
-    RESULTS[message.chat.id] = results
-    lines = ["🎵 این‌ها رو پیدا کردم، یکی رو انتخاب کن:\n"]
-    markup = types.InlineKeyboardMarkup()
-    for i, item in enumerate(results):
-        lines.append(f"{i + 1}. {item['title']} ({item['source']})")
-        label = item['title'][:30]
-        markup.add(types.InlineKeyboardButton(f"{i + 1}. {label}", callback_data=f"dl:{i}"))
-    bot.send_message(message.chat.id, "\n".join(lines), reply_markup=markup)
+    show_results(message.chat.id, results, "🎵 این‌ها رو پیدا کردم، یکی رو انتخاب کن:")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('dl:'))
