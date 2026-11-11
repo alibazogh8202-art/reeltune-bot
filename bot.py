@@ -2,6 +2,8 @@ import os
 import glob
 import asyncio
 import subprocess
+import threading
+import uuid
 import telebot
 from telebot import types
 import yt_dlp
@@ -10,6 +12,16 @@ from flask import Flask, request
 TOKEN = os.environ.get("TOKEN")
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+
+# One download at a time per chat, so tapping two versions quickly
+# cannot mix their files up.
+_CHAT_LOCKS = {}
+_CHAT_LOCKS_GUARD = threading.Lock()
+
+
+def chat_lock(chat_id):
+    with _CHAT_LOCKS_GUARD:
+        return _CHAT_LOCKS.setdefault(chat_id, threading.Lock())
 
 WELCOME = """سلام! به ReelTune خوش اومدی 🎵
 آهنگی که شنیدی، همین‌جا بگیر
@@ -91,22 +103,34 @@ def show_results(chat_id, results, header):
     bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
 
 
+def _own_files(uid):
+    return glob.glob(f'reeltune-{uid}.*')
+
+
+def _cleanup(uid):
+    for old in _own_files(uid):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
 def download_audio(query, title_hint=None):
+    # A unique file per download: the old shared 'reeltune.*' name meant
+    # a second tap could overwrite the file the first tap was about to send,
+    # so the user got the previous version instead of the one they tapped.
+    uid = uuid.uuid4().hex[:8]
     last_error = None
     for client in (['android', 'web'], ['ios', 'web'], ['web']):
         opts = {
             'format': 'bestaudio/best',
-            'outtmpl': 'reeltune.%(ext)s',
+            'outtmpl': f'reeltune-{uid}.%(ext)s',
             'noplaylist': True,
             'quiet': True,
             'no_warnings': True,
             'extractor_args': {'youtube': {'player_client': client}},
         }
-        for old in glob.glob('reeltune.*'):
-            try:
-                os.remove(old)
-            except OSError:
-                pass
+        _cleanup(uid)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(query, download=True)
@@ -121,28 +145,42 @@ def download_audio(query, title_hint=None):
         except Exception as e:
             print('ReelTune download failed', client, 'for', query, ':', repr(e), flush=True)
             last_error = e
+            # yt-dlp sometimes downloads the whole file and then fails on
+            # a later step; if a usable file exists, use it instead of
+            # throwing it away.
+            files = [f for f in _own_files(uid) if os.path.getsize(f) > 50000]
+            if files:
+                print('ReelTune using downloaded file despite error:', files[0], flush=True)
+                return files[0], title_hint or 'ReelTune', False
     # YouTube blocked the download from this server's IP. Try the same
     # song on SoundCloud, which does not do YouTube's bot check.
     if title_hint and ('youtube.com' in query or 'youtu.be' in query):
         clean = title_hint.split('|')[0].split('(')[0].strip()
         print('ReelTune trying SoundCloud fallback for', clean, flush=True)
-        sc = search_source('scsearch1:' + clean, limit=1)
-        if sc:
+        sc = search_source('scsearch3:' + clean, limit=3)
+        if not sc:
+            print('ReelTune SoundCloud fallback: no results for', clean, flush=True)
+        else:
+            # Pick the closest title match, so "Sare To 2" does not
+            # fall back to "Sare To" (version 1).
+            def score(item):
+                words = set(clean.lower().split())
+                item_words = set(item['title'].lower().split())
+                return len(words & item_words)
+            sc.sort(key=score, reverse=True)
+            chosen = sc[0]
+            print('ReelTune SoundCloud fallback chose', chosen, flush=True)
             try:
                 opts = {
                     'format': 'bestaudio/best',
-                    'outtmpl': 'reeltune.%(ext)s',
+                    'outtmpl': f'reeltune-{uid}.%(ext)s',
                     'noplaylist': True,
                     'quiet': True,
                     'no_warnings': True,
                 }
-                for old in glob.glob('reeltune.*'):
-                    try:
-                        os.remove(old)
-                    except OSError:
-                        pass
+                _cleanup(uid)
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(sc[0]['url'], download=True)
+                    info = ydl.extract_info(chosen['url'], download=True)
                     filename = ydl.prepare_filename(info)
                     title = info.get('title', clean)
                     return filename, title, True
@@ -187,7 +225,7 @@ def recognize_song(filename):
         return None
     # Shazam cannot read Instagram's AAC files directly
     # ("aac too complex"), so convert to plain WAV first with ffmpeg.
-    wav = 'reeltune-shazam.wav'
+    wav = f'reeltune-shazam-{uuid.uuid4().hex[:8]}.wav'
     try:
         subprocess.run(
             ['ffmpeg', '-y', '-v', 'error', '-i', filename,
@@ -299,15 +337,16 @@ def on_download(call):
     item = results[idx]
     bot.answer_callback_query(call.id, "دارم دانلود می‌کنم... 🎧")
     bot.send_message(call.message.chat.id, f"دارم «{item['title']}» رو می‌فرستم... 🎧")
-    try:
-        filename, title, via_sc = download_audio(item['url'], title_hint=item['title'])
-        if via_sc:
-            bot.send_message(call.message.chat.id, "یوتیوب دانلود رو بلاک کرد، نسخه ساندکلاد رو می‌فرستم 🎧")
-        send_song(call.message.chat.id, filename, title)
-        os.remove(filename)
-    except Exception as e:
-        print('ReelTune callback download failed for', item, ':', repr(e), flush=True)
-        bot.send_message(call.message.chat.id, "نتونستم این نسخه رو دانلود کنم. یه نسخه دیگه رو امتحان کن.")
+    with chat_lock(call.message.chat.id):
+        try:
+            filename, title, via_sc = download_audio(item['url'], title_hint=item['title'])
+            if via_sc:
+                bot.send_message(call.message.chat.id, "یوتیوب دانلود رو بلاک کرد، نسخه ساندکلاد رو می‌فرستم 🎧")
+            send_song(call.message.chat.id, filename, title)
+            os.remove(filename)
+        except Exception as e:
+            print('ReelTune callback download failed for', item, ':', repr(e), flush=True)
+            bot.send_message(call.message.chat.id, "نتونستم این نسخه رو دانلود کنم، یوتیوب بلاکش کرد و ساندکلاد هم پیداش نکرد. یه نسخه دیگه رو امتحان کن.")
 
 
 @app.route('/' + TOKEN, methods=['POST'])
