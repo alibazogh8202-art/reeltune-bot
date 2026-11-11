@@ -163,10 +163,15 @@ def download_audio(query, title_hint=None):
         else:
             # Pick the closest title match, so "Sare To 2" does not
             # fall back to "Sare To" (version 1).
+            # Score only the song name, not the artist: "Shayan Yo - Sare To"
+            # must not tie with "Sare To 2". Prefer an exact title match and
+            # penalise extra words in the candidate title.
+            song = clean.split(' - ')[-1].strip()
+            song_words = set(song.lower().split())
+
             def score(item):
-                words = set(clean.lower().split())
                 item_words = set(item['title'].lower().split())
-                return len(words & item_words)
+                return len(song_words & item_words) - len(item_words - song_words)
             sc.sort(key=score, reverse=True)
             chosen = sc[0]
             print('ReelTune SoundCloud fallback chose', chosen, flush=True)
