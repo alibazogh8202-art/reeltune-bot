@@ -1,6 +1,8 @@
 import os
 import glob
 import asyncio
+import json
+import re
 import subprocess
 import threading
 import uuid
@@ -33,7 +35,28 @@ WELCOME = """سلام! به ReelTune خوش اومدی 🎵
 PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
 
 # chat_id -> list of {title, url, source}
+# Kept in memory and in results.json on disk, so buttons still work
+# after the free server wakes up from sleep (memory alone is lost then).
 RESULTS = {}
+RESULTS_FILE = 'results.json'
+try:
+    with open(RESULTS_FILE, 'r', encoding='utf-8') as _f:
+        RESULTS = {int(k): v for k, v in json.load(_f).items()}
+except Exception:
+    RESULTS = {}
+
+
+def save_results():
+    try:
+        with open(RESULTS_FILE, 'w', encoding='utf-8') as _f:
+            json.dump({str(k): v for k, v in RESULTS.items()}, _f, ensure_ascii=False)
+    except Exception as e:
+        print('ReelTune save results failed:', repr(e), flush=True)
+
+
+# Update ids already handled, so a slow download that makes Telegram
+# resend the same update does not send the song twice.
+SEEN_UPDATES = set()
 
 
 def normalize(text):
@@ -41,35 +64,39 @@ def normalize(text):
 
 
 def search_source(query, limit=5):
-    opts = {
-        'format': 'bestaudio/best',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'extract_flat': True,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-    except Exception as e:
-        print('ReelTune search failed for', query, ':', repr(e), flush=True)
-        return []
-    entries = info.get('entries') or []
-    out = []
-    for e in entries[:limit]:
-        if not e:
+    for clients in (['android', 'web'], ['ios', 'web']):
+        opts = {
+            'format': 'bestaudio/best',
+            'noplaylist': True,
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'extract_flat': True,
+            'extractor_args': {'youtube': {'player_client': clients}},
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+        except Exception as e:
+            print('ReelTune search failed for', query, ':', repr(e), flush=True)
             continue
-        title = e.get('title') or 'بدون عنوان'
-        url = e.get('webpage_url') or e.get('url') or ''
-        if not url:
-            continue
-        source = 'YouTube'
-        if 'soundcloud' in url:
-            source = 'SoundCloud'
-        out.append({'title': title, 'url': url, 'source': source})
-    return out
+        entries = info.get('entries') or []
+        out = []
+        for e in entries[:limit]:
+            if not e:
+                continue
+            title = e.get('title') or 'بدون عنوان'
+            url = e.get('webpage_url') or e.get('url') or ''
+            if not url:
+                continue
+            source = 'YouTube'
+            if 'soundcloud' in url:
+                source = 'SoundCloud'
+            out.append({'title': title, 'url': url, 'source': source})
+        if out:
+            return out
+        print('ReelTune search empty for', query, 'with', clients, ', retrying', flush=True)
+    return []
 
 
 def search_all(text):
@@ -94,12 +121,20 @@ def search_all(text):
 
 def show_results(chat_id, results, header):
     RESULTS[chat_id] = results
+    save_results()
     lines = [header, ""]
     markup = types.InlineKeyboardMarkup()
     for i, item in enumerate(results):
         lines.append(f"{i + 1}. {item['title']} ({item['source']})")
         label = item['title'][:30]
-        markup.add(types.InlineKeyboardButton(f"{i + 1}. {label}", callback_data=f"dl:{i}"))
+        # YouTube buttons carry the video id itself, so they still work
+        # even if the saved results are lost (e.g. after a redeploy).
+        m = re.search(r'[?&]v=([A-Za-z0-9_-]{11})', item['url'])
+        if item['source'] == 'YouTube' and m:
+            cb = f"y:{i}:{m.group(1)}"
+        else:
+            cb = f"dl:{i}"
+        markup.add(types.InlineKeyboardButton(f"{i + 1}. {label}", callback_data=cb))
     bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
 
 
@@ -328,18 +363,35 @@ def handle(message):
     show_results(message.chat.id, results, "🎵 این‌ها رو پیدا کردم، یکی رو انتخاب کن:")
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith('dl:'))
+@bot.callback_query_handler(func=lambda c: c.data.startswith(('dl:', 'y:')))
 def on_download(call):
-    try:
-        idx = int(call.data.split(':')[1])
-    except (ValueError, IndexError):
-        bot.answer_callback_query(call.id, "انتخاب نامعتبر است.")
-        return
-    results = RESULTS.get(call.message.chat.id, [])
-    if idx < 0 or idx >= len(results):
-        bot.answer_callback_query(call.id, "این مورد دیگه در دسترس نیست، دوباره جستجو کن.")
-        return
-    item = results[idx]
+    item = None
+    if call.data.startswith('y:'):
+        try:
+            _p, idx, video_id = call.data.split(':')
+            idx = int(idx)
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "انتخاب نامعتبر است.")
+            return
+        # Title comes from the numbered list message itself, so the
+        # SoundCloud fallback still knows the song name.
+        title = None
+        for line in (call.message.text or '').splitlines():
+            if line.startswith(f"{idx + 1}. "):
+                title = line[len(f"{idx + 1}. "):].rsplit(' (', 1)[0]
+                break
+        item = {'title': title or 'ReelTune', 'url': f"https://www.youtube.com/watch?v={video_id}", 'source': 'YouTube'}
+    else:
+        try:
+            idx = int(call.data.split(':')[1])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "انتخاب نامعتبر است.")
+            return
+        results = RESULTS.get(call.message.chat.id, [])
+        if idx < 0 or idx >= len(results):
+            bot.answer_callback_query(call.id, "این مورد دیگه در دسترس نیست، دوباره جستجو کن.")
+            return
+        item = results[idx]
     bot.answer_callback_query(call.id, "دارم دانلود می‌کنم... 🎧")
     bot.send_message(call.message.chat.id, f"دارم «{item['title']}» رو می‌فرستم... 🎧")
     with chat_lock(call.message.chat.id):
@@ -357,6 +409,11 @@ def on_download(call):
 @app.route('/' + TOKEN, methods=['POST'])
 def webhook():
     update = telebot.types.Update.de_json(request.stream.read().decode('utf-8'))
+    if update.update_id in SEEN_UPDATES:
+        return 'ok', 200
+    SEEN_UPDATES.add(update.update_id)
+    if len(SEEN_UPDATES) > 200:
+        SEEN_UPDATES.clear()
     bot.process_new_updates([update])
     return 'ok', 200
 
