@@ -1,6 +1,7 @@
 import os
 import glob
 import asyncio
+import subprocess
 import telebot
 from telebot import types
 import yt_dlp
@@ -90,7 +91,7 @@ def show_results(chat_id, results, header):
     bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
 
 
-def download_audio(query):
+def download_audio(query, title_hint=None):
     last_error = None
     for client in (['android', 'web'], ['ios', 'web'], ['web']):
         opts = {
@@ -116,10 +117,37 @@ def download_audio(query):
                     info = entries[0]
                 filename = ydl.prepare_filename(info)
                 title = info.get('title', 'ReelTune')
-                return filename, title
+                return filename, title, False
         except Exception as e:
             print('ReelTune download failed', client, 'for', query, ':', repr(e), flush=True)
             last_error = e
+    # YouTube blocked the download from this server's IP. Try the same
+    # song on SoundCloud, which does not do YouTube's bot check.
+    if title_hint and ('youtube.com' in query or 'youtu.be' in query):
+        clean = title_hint.split('|')[0].split('(')[0].strip()
+        print('ReelTune trying SoundCloud fallback for', clean, flush=True)
+        sc = search_source('scsearch1:' + clean, limit=1)
+        if sc:
+            try:
+                opts = {
+                    'format': 'bestaudio/best',
+                    'outtmpl': 'reeltune.%(ext)s',
+                    'noplaylist': True,
+                    'quiet': True,
+                    'no_warnings': True,
+                }
+                for old in glob.glob('reeltune.*'):
+                    try:
+                        os.remove(old)
+                    except OSError:
+                        pass
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(sc[0]['url'], download=True)
+                    filename = ydl.prepare_filename(info)
+                    title = info.get('title', clean)
+                    return filename, title, True
+            except Exception as e:
+                print('ReelTune SoundCloud fallback failed:', repr(e), flush=True)
     raise last_error
 
 
@@ -157,6 +185,17 @@ def recognize_song(filename):
     except Exception as e:
         print('ReelTune shazam import failed:', repr(e), flush=True)
         return None
+    # Shazam cannot read Instagram's AAC files directly
+    # ("aac too complex"), so convert to plain WAV first with ffmpeg.
+    wav = 'reeltune-shazam.wav'
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-v', 'error', '-i', filename,
+             '-ar', '44100', '-ac', '1', wav],
+            timeout=30, check=True)
+        filename = wav
+    except Exception as e:
+        print('ReelTune ffmpeg convert for shazam failed:', repr(e), flush=True)
 
     async def _run():
         shazam = Shazam()
@@ -167,6 +206,11 @@ def recognize_song(filename):
     except Exception as e:
         print('ReelTune shazam failed:', repr(e), flush=True)
         return None
+    finally:
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
     track = (out or {}).get('track') or {}
     title = track.get('title')
     artist = track.get('subtitle')
@@ -187,7 +231,7 @@ def handle_reel(chat_id, url):
             return
     # 2) Listen to the reel audio and recognise it (Shazam).
     try:
-        filename, _title = download_audio(url)
+        filename, _title, _via_sc = download_audio(url)
     except Exception as e:
         print('ReelTune reel download failed:', repr(e), flush=True)
         bot.send_message(chat_id, "نتونستم ریلز رو دانلود کنم. لینک درست رو دوباره بفرست.")
@@ -256,7 +300,9 @@ def on_download(call):
     bot.answer_callback_query(call.id, "دارم دانلود می‌کنم... 🎧")
     bot.send_message(call.message.chat.id, f"دارم «{item['title']}» رو می‌فرستم... 🎧")
     try:
-        filename, title = download_audio(item['url'])
+        filename, title, via_sc = download_audio(item['url'], title_hint=item['title'])
+        if via_sc:
+            bot.send_message(call.message.chat.id, "یوتیوب دانلود رو بلاک کرد، نسخه ساندکلاد رو می‌فرستم 🎧")
         send_song(call.message.chat.id, filename, title)
         os.remove(filename)
     except Exception as e:
